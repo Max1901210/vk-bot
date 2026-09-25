@@ -2,11 +2,11 @@ name: vk-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # каждые 5 минут
+  workflow_dispatch: {}      # кнопка «Run workflow» для ручного теста
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   duty:
@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,3 +27,9 @@ jobs:
           AI_KEY: ${{ secrets.AI_KEY }}
           PROVIDER: openrouter
           RUN_SECONDS: "260"
+      - name: Сохранить память бота
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "vk-bot"
+          git add bot_state.json
+          git diff --cached --quiet || (git commit -m "память бота" && git push)
