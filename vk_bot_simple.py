@@ -22,7 +22,7 @@
 import base64
 import json
 import os
-import sqlite3
+import re
 import sys
 import threading
 import time
@@ -37,7 +37,20 @@ except Exception:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(SCRIPT_DIR, "bot_settings.json")
-DB_FILE = os.path.join(SCRIPT_DIR, "bot_history.db")
+STATE_FILE = os.path.join(SCRIPT_DIR, os.environ.get("STATE_FILE", "bot_state.json"))
+HISTORY_LIMIT = 20  # сообщений диалога в памяти (на пользователя)
+
+
+def _load_state() -> dict:
+    """Состояние бота: жанры, история, накопленные фото.
+    В облаке файл коммитится обратно в репозиторий — память живёт вечно."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 VK_API = os.environ.get("VK_API_BASE", "https://api.vk.com/method/")
 
 # Провайдеры ИИ: имя -> (адрес API, модель, запасные модели, где взять ключ)
@@ -69,6 +82,92 @@ VISION_MODELS = [
     ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 12000),
     ("google/gemma-4-31b-it:free", 4000),
 ]
+
+# накопитель фото: присылаешь по одному — бот копит и отвечает на все сразу
+PHOTO_BUFFERS: dict[int, dict] = {}
+
+# ---- профили ИИ под задачи («жанры») ----
+# каждый жанр = своя цепочка моделей + своя специализация («личность»).
+# если модель занята/удалена из бесплатных — автоматически берём следующую
+GENRES = {
+    "auto": ("🌐 Универсальная", [
+        "nvidia/nemotron-3.5-lightning:free",
+        "dots-studio/dots-3-note-preview:free",
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+    ], ""),
+    "study": ("🎓 Учёба и сложные задачи", [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "google/gemma-4-31b-it:free",
+        "dots-studio/dots-3-note-preview:free",
+    ], "Ты — терпеливый репетитор. Объясняй пошагово и простыми словами, "
+       "с примерами из жизни. Задачи решай полностью: что дано, какая "
+       "формула, подстановка, вычисление, ответ. В конце — краткий вывод."),
+    "math": ("🧮 Математика и физика", [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "dots-studio/dots-3-note-preview:free",
+    ], "Ты — строгий математик. Решение оформляй по схеме: Дано / Формула / "
+       "Подстановка / Вычисление / Ответ. Перепроверяй арифметику. Единицы "
+       "измерения указывай всегда."),
+    "lang": ("🌍 Переводчик и языки", [
+        "nvidia/nemotron-3.5-lightning:free",
+        "google/gemma-4-31b-it:free",
+        "dots-studio/dots-3-note-preview:free",
+    ], "Ты — профессиональный переводчик. Присланный текст переводи на "
+       "русский (или на язык, указанный в запросе), сохраняя стиль и тон. "
+       "После перевода дай 1-2 коротких заметки о нюансах перевода."),
+    "texts": ("✍️ Сочинения и тексты", [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3.5-lightning:free",
+    ], "Ты — писатель и редактор. Пиши живым, чистым языком, без воды. "
+       "Для сочинений сначала краткий план, затем сам текст. Соблюдай "
+       "запрошенный объём и стиль (или разумный по умолчанию)."),
+    "code": ("💻 Программирование", [
+        "qwen/qwen3.8-27b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "dots-studio/dots-3-note-preview:free",
+    ], "Ты — опытный разработчик. Давай рабочий код в блоках ``` с языком, "
+       "кратко поясняй логику, предупреждай о подводных камнях и предлагай "
+       "как улучшить."),
+    "fast": ("⚡ Быстрые ответы", [
+        "dots-studio/dots-3-note-preview:free",
+        "nvidia/nemotron-3.5-lightning:free",
+    ], "Отвечай максимально кратко и по делу: только суть, без вступлений "
+       "и повторов вопроса. Максимум 3-4 предложения, если не попросили иначе."),
+}
+GENRE_ORDER = ["auto", "study", "fast", "code"]
+USER_GENRE: dict[int, str] = {}      # uid -> жанр
+DRAW_PENDING: set[int] = set()       # uid, нажавших «Нарисуй»
+MENU_PENDING: dict[int, float] = {}  # uid -> время показа меню моделей
+
+_STATE = _load_state()
+USER_GENRE.update({int(k): v for k, v in _STATE.get("genres", {}).items()})
+PHOTO_BUFFERS.update({int(k): v for k, v in _STATE.get("buffers", {}).items()})
+HISTORY: dict[int, list] = {int(k): v for k, v in _STATE.get("history", {}).items()}
+# постоянные факты о пользователе («запомни: я в 9 классе»)
+FACTS: dict[int, list] = {int(k): v for k, v in _STATE.get("facts", {}).items()}
+# напоминания: uid -> [{"at": ts, "peer": id, "text": str}]
+REMINDERS: dict[int, list] = {int(k): v for k, v in _STATE.get("reminders", {}).items()}
+
+
+def save_state() -> None:
+    data = {
+        "genres": {str(k): v for k, v in USER_GENRE.items()},
+        "buffers": {str(k): v for k, v in PHOTO_BUFFERS.items()},
+        "history": {str(k): v for k, v in HISTORY.items()},
+        "facts": {str(k): v for k, v in FACTS.items()},
+        "reminders": {str(k): v for k, v in REMINDERS.items()},
+    }
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print("   (состояние не сохранено:", e, ")")
 
 SYSTEM_PROMPT = (
     "Ты — дружелюбный ИИ-ассистент внутри ВКонтакте. Отвечай на языке "
@@ -167,8 +266,13 @@ def vk(method: str, **params):
     return data.get("response")
 
 
-def vk_send(peer_id: int, text: str, keyboard: dict | None = None):
-    params = {"peer_id": peer_id, "message": text, "random_id": int(time.time() * 1000) % 2**31}
+def vk_send(peer_id: int, text: str, keyboard: dict | None = None,
+            attachment: str | None = None):
+    params = {"peer_id": peer_id, "random_id": int(time.time() * 1000) % 2**31}
+    if text:
+        params["message"] = text
+    if attachment:
+        params["attachment"] = attachment
     if keyboard:
         params["keyboard"] = json.dumps(keyboard, ensure_ascii=False)
     return vk("messages.send", **params)
@@ -190,51 +294,200 @@ def vk_typing(peer_id: int) -> None:
         pass
 
 
+def vk_upload_photo(peer_id: int, img: bytes) -> str:
+    """Загружает картинку в сообщения VK, возвращает attachment вида photo1_2."""
+    r = vk("photos.getMessagesUploadServer", peer_id=peer_id)
+    url = r["upload_url"]
+    boundary = "----vkbot" + str(int(time.time() * 1000))
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="photo"; filename="img.jpg"\r\n'
+        "Content-Type: image/jpeg\r\n\r\n"
+    ).encode() + img + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    up = json.loads(urllib.request.urlopen(req, timeout=90).read())
+    saved = vk("photos.saveMessagesPhoto", server=up["server"],
+               photo=up["photo"], hash=up["hash"])
+    p = (saved or [{}])[0]
+    return f"photo{p['owner_id']}_{p['id']}"
+
+
+def wiki_summary(query: str) -> tuple[str, str] | None:
+    """Краткая справка из Википедии: (текст, ссылка) или None."""
+    try:
+        q = urllib.parse.quote(query.strip()[:120])
+        s_data = json.loads(http_get_bytes(
+            "https://ru.wikipedia.org/w/api.php?action=query&list=search"
+            f"&srsearch={q}&format=json&utf8=1&srlimit=1"))
+        hits = ((s_data.get("query") or {}).get("search")) or []
+        if not hits:
+            return None
+        title = urllib.parse.quote(hits[0]["title"].replace(" ", "_"))
+        d = json.loads(http_get_bytes(
+            "https://ru.wikipedia.org/api/rest_v1/page/summary/" + title))
+        extract = (d.get("extract") or "").strip()
+        if not extract:
+            return None
+        url = ((d.get("content_urls") or {}).get("desktop") or {}).get("page", "")
+        return extract[:1200], url
+    except Exception as e:
+        print("   (вики:", e, ")")
+        return None
+
+
+def voice_answer(audio_url: str, instruction: str) -> str:
+    """Голосовое -> omni-модель: расшифровывает и выполняет просьбу."""
+    raw = http_get_bytes(audio_url)
+    b64 = base64.b64encode(raw).decode()
+    parts = [{"type": "text", "text": instruction or
+              "Это голосовое сообщение. Расшифруй его про себя и выполни "
+              "просьбу. Ответь по-русски кратко и по делу."},
+             {"type": "input_audio",
+              "input_audio": {"data": b64, "format": "ogg"}}]
+    p = PROVIDERS[SETTINGS["provider"]]
+    body = {"model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "messages": [{"role": "user", "content": parts}],
+            "max_tokens": 8000}
+    headers = {"Authorization": "Bearer " + SETTINGS["api_key"],
+               "Content-Type": "application/json",
+               "X-Title": "VK AI Bot"}
+    last = "unknown"
+    for _ in range(2):
+        try:
+            data = http_post(p["base"] + "/chat/completions", json_body=body,
+                             headers=headers, timeout=300)
+            ch = (data.get("choices") or [{}])[0]
+            content = (ch.get("message") or {}).get("content", "")
+            if content and content.strip():
+                return content.strip()
+            if ch.get("finish_reason") == "length":
+                body["max_tokens"] = 12000
+                continue
+            last = "пустой ответ"
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+            if e.code in (401, 403):
+                raise RuntimeError("Ключ нейросети не принят.")
+        except Exception as e:
+            last = repr(e)[:100]
+        time.sleep(2)
+    raise RuntimeError("Не получилось разобрать голосовое (" + last + "). "
+                       "Напиши текстом — отвечу сразу.")
+
+
+REMINDER_RE = re.compile(
+    r"напомни\s+через\s+(\d+)\s*"
+    r"(сек\S*|мин\S*|час\S*|ч\b|дн\S*|день|день|сут\S*)", re.I)
+
+
+def parse_reminder(text: str) -> tuple[int, str] | None:
+    m = REMINDER_RE.search(text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    mult = 60
+    if unit.startswith("час") or unit == "ч":
+        mult = 3600
+    elif unit.startswith("дн") or unit.startswith("день") or unit.startswith("сут"):
+        mult = 86400
+    rest = text[m.end():].strip(" ,-—:")
+    return n * mult, rest
+
+
+def check_reminders() -> None:
+    """Отправляет сработавшие напоминания (вызывается каждый цикл)."""
+    now = time.time()
+    fired = False
+    for uid in list(REMINDERS):
+        left = []
+        for r in REMINDERS[uid]:
+            if r["at"] <= now:
+                try:
+                    vk_send(r.get("peer") or uid, "⏰ Напоминание: " + (r["text"] or "пора!"))
+                except RuntimeError as e:
+                    print("   (напоминание:", e, ")")
+                fired = True
+            else:
+                left.append(r)
+        if left:
+            REMINDERS[uid] = left
+        else:
+            REMINDERS.pop(uid, None)
+    if fired:
+        save_state()
+
+
+def facts_block(uid: int) -> str:
+    facts = FACTS.get(uid) or []
+    if not facts:
+        return ""
+    return "\n\nИзвестно о пользователе (учитывай это):\n" + "\n".join(
+        f"- {f}" for f in facts[-10:])
+
+
+def draw_image(prompt: str) -> bytes:
+    """Бесплатная генерация картинки (Pollinations, без ключей)."""
+    url = ("https://image.pollinations.ai/prompt/"
+           + urllib.parse.quote(prompt[:500])
+           + "?width=1024&height=1024&nologo=true")
+    last = None
+    for _ in range(2):
+        try:
+            return http_get_bytes(url)
+        except Exception as e:
+            last = e
+            time.sleep(3)
+    raise RuntimeError(f"Художник занят, попробуй ещё раз ({last})")
+
+
 # ------------------------------ история ----------------------------------- #
-
-DB_LOCK = threading.Lock()
-
-
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS h ("
-        " uid INTEGER, role TEXT, content TEXT, id INTEGER PRIMARY KEY AUTOINCREMENT)"
-    )
-    return conn
 
 
 def history_get(uid: int, limit: int = 12) -> list:
-    with DB_LOCK:
-        c = db()
-        rows = c.execute(
-            "SELECT role, content FROM (SELECT id, role, content FROM h "
-            "WHERE uid=? ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
-            (uid, limit),
-        ).fetchall()
-        c.close()
-    return [{"role": r[0], "content": r[1]} for r in rows]
+    return list(HISTORY.get(uid, []))[-limit:]
 
 
 def history_add(uid: int, user_text: str, answer: str) -> None:
-    with DB_LOCK:
-        c = db()
-        c.execute("INSERT INTO h (uid, role, content) VALUES (?,?,?)", (uid, "user", user_text))
-        c.execute("INSERT INTO h (uid, role, content) VALUES (?,?,?)", (uid, "assistant", answer))
-        c.execute(
-            "DELETE FROM h WHERE uid=? AND id NOT IN "
-            "(SELECT id FROM h WHERE uid=? ORDER BY id DESC LIMIT 24)", (uid, uid)
-        )
-        c.commit()
-        c.close()
+    h = HISTORY.setdefault(uid, [])
+    h.append({"role": "user", "content": user_text})
+    h.append({"role": "assistant", "content": answer})
+    HISTORY[uid] = h[-HISTORY_LIMIT:]
+    save_state()
 
 
 def history_clear(uid: int) -> None:
-    with DB_LOCK:
-        c = db()
-        c.execute("DELETE FROM h WHERE uid=?", (uid,))
-        c.commit()
-        c.close()
+    HISTORY.pop(uid, None)
+    save_state()
+
+
+def set_genre(uid: int, gid: str) -> None:
+    USER_GENRE[uid] = gid
+    save_state()
+
+
+def clear_user_state(uid: int) -> None:
+    USER_GENRE.pop(uid, None)
+    PHOTO_BUFFERS.pop(uid, None)
+    HISTORY.pop(uid, None)
+    save_state()
+
+
+def detect_genre(text: str) -> str | None:
+    """Умный автоподбор профиля по тексту запроса."""
+    t = text.lower()
+    if re.search(r"переведи|translate|на английский|на русский|перевод", t):
+        return "lang"
+    if re.search(r"сочинени|эссе|стих|рассказ|доклад|напиши текст", t):
+        return "texts"
+    if re.search(r"код|python|javascript|\bjava\b|c\+\+|программ|скрипт|функц", t):
+        return "code"
+    if re.search(r"реши|уравнен|задач|вычисли|пример|найди площадь|\d+\s*[+\-*/^=]", t):
+        return "math"
+    if re.search(r"объясни|почему|как работает|что такое|расскажи подробнее", t):
+        return "study"
+    return None
 
 
 # ------------------------------ нейросеть --------------------------------- #
@@ -260,10 +513,20 @@ def md_to_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def ai_chat(messages: list) -> str:
+def ai_chat(messages: list, uid: int | None = None,
+            genre: str | None = None) -> str:
     """Задаём вопрос нейросети (не стриминг — просто ждём ответ)."""
     p = PROVIDERS[SETTINGS["provider"]]
-    models = [p["model"]] + p["fallbacks"]
+    genre = genre or (USER_GENRE.get(uid) if uid else None)
+    extra_system = ""
+    if genre and genre in GENRES:
+        models = list(GENRES[genre][1])
+        extra_system = GENRES[genre][2]
+    else:
+        models = [p["model"]] + p["fallbacks"]
+    if extra_system and messages and messages[0].get("role") == "system":
+        messages = [dict(messages[0])]
+        messages[0]["content"] += "\n\n" + extra_system
     headers = {"Authorization": "Bearer " + SETTINGS["api_key"]}
     if SETTINGS["provider"] == "openrouter":
         headers["X-Title"] = "VK AI Bot"
@@ -303,7 +566,7 @@ def ai_vision(prompt: str, image_urls: list) -> str:
     """Вопрос про картинки: пробуем несколько моделей со «зрением» по очереди."""
     parts = [{"type": "text", "text": prompt or "Что на картинке?"}]
     loaded = 0
-    for u in image_urls[:2]:
+    for u in image_urls[:10]:
         try:
             raw = http_get_bytes(u)
             b64 = base64.b64encode(raw).decode()
@@ -357,17 +620,122 @@ def model_supports_vision() -> bool:
 # ------------------------------ обработка --------------------------------- #
 
 WELCOME = (
-    "Привет! Я ИИ-бот 🤖 Напиши мне что угодно — отвечу.\n\n"
-    "/new — начать разговор заново\n"
-    "/model — какая модель работает\n"
-    "Можно прислать картинку с вопросом — опишу."
+    "Привет! Я твой ИИ-помощник 🤖\n\n"
+    "📸 Кидай фото заданий (можно сразу несколько) + текст — решу всё одним ответом\n"
+    "🎨 «Нарисуй рыжего кота в космосе» — нарисую картинку\n"
+    "🧠 Сам подбираю профиль под запрос (математика, код, перевод…)\n"
+    "🎤 Голосовые — просто говори, я пойму и отвечу\n"
+    "⏰ «Напомни через 30 минут …» — не забуду\n"
+    "🧷 «Запомни: я в 9 классе» — учту всегда\n"
+    "📚 «Что такое фотосинтез» — справка из Википедии\n"
+    "👤 «Профиль» — твоя статистика\n"
+    "🆕 «Новый диалог» — забуду контекст\n\n"
+    "Просто пиши вопросы — отвечу!"
 )
+
+# постоянная меню-клавиатура (внизу чата)
+MENU_KEYBOARD = {
+    "one_time": False,
+    "buttons": [
+        [
+            {"action": {"type": "text", "label": "📸 Задание по фото"}, "color": "primary"},
+            {"action": {"type": "text", "label": "🎨 Нарисуй"}, "color": "positive"},
+        ],
+        [
+            {"action": {"type": "text", "label": "🧠 Модель"}, "color": "secondary"},
+            {"action": {"type": "text", "label": "👤 Профиль"}, "color": "secondary"},
+            {"action": {"type": "text", "label": "🆕 Новый диалог"}, "color": "negative"},
+        ],
+    ],
+}
+
+BUTTONS = {"photo": "📸 задание по фото", "draw": "🎨 нарисуй",
+           "model": "🧠 модель", "profile": "👤 профиль", "new": "🆕 новый диалог"}
+
+
+def models_menu_text(uid: int) -> str:
+    cur = USER_GENRE.get(uid, "auto")
+    lines = ["🧠 Выбери профиль ИИ — ответь номером (например: 2):", ""]
+    for i, gid in enumerate(GENRE_ORDER, 1):
+        mark = "✅ " if gid == cur else ""
+        lines.append(f"{mark}{i}. {GENRES[gid][0]}")
+    lines += ["", "📸 Фото заданий принимаю всегда — просто пришли картинку."]
+    return "\n".join(lines)
+
+
+def profile_text(uid: int) -> str:
+    gid = USER_GENRE.get(uid, "auto")
+    h = history_get(uid, limit=100)
+    msgs = len(h) // 2
+    facts = FACTS.get(uid) or []
+    rems = REMINDERS.get(uid) or []
+    out = ("👤 Твой профиль\n\n"
+           f"🧠 Профиль ИИ: {GENRES[gid][0]}\n"
+           f"💬 Сообщений в диалоге: {msgs}\n"
+           f"🧷 Фактов обо мне: {len(facts)}\n"
+           f"⏰ Активных напоминаний: {len(rems)}")
+    if facts:
+        out += "\n\n🧷 Я помню:\n" + "\n".join(f"• {f}" for f in facts[-7:])
+    out += ("\n\nСменить профиль: «Модель»\n"
+            "Очистить диалог: «Новый диалог»\n"
+            "Забыть факты: «забудь обо мне»")
+    return out
 
 
 def typing_loop(peer_id: int, stop: threading.Event) -> None:
     while not stop.is_set():
         vk_typing(peer_id)
         stop.wait(4.0)
+
+
+DEFAULT_PHOTO_TASK = ("На фотографиях задания. Реши ВСЕ по порядку кратко: "
+                      "краткое условие, решение, ответ. По-русски.")
+
+
+def answer_photos(peer_id: int, uid: int, urls: list, task: str) -> None:
+    """Отвечает одним сообщением на пачку фото."""
+    try:
+        answer = ai_vision(task or DEFAULT_PHOTO_TASK, urls)
+    except RuntimeError as e:
+        vk_send(peer_id, "😔 " + str(e))
+        return
+    except Exception as e:
+        vk_send(peer_id, "😔 Непредвиденная ошибка: " + repr(e))
+        return
+    for part in split_reply(answer):
+        vk_send(peer_id, part)
+
+
+def flush_buffers(max_age: float = 110.0) -> None:
+    """Если задание так и не написали — отвечаем на накопленные фото сами."""
+    now = time.time()
+    for uid in list(PHOTO_BUFFERS):
+        b = PHOTO_BUFFERS[uid]
+        if b["urls"] and now - b["ts"] > max_age:
+            PHOTO_BUFFERS.pop(uid, None)
+            save_state()
+            threading.Thread(
+                target=answer_photos,
+                args=(b.get("peer") or uid, uid, b["urls"], ""),
+                daemon=True,
+            ).start()
+
+
+def flush_all_buffers(max_age: float = 0.0) -> None:
+    """Отвечаем на старые незакрытые пачки; свежие — оставляем в состоянии."""
+    now = time.time()
+    for uid in list(PHOTO_BUFFERS):
+        b = PHOTO_BUFFERS.get(uid)
+        if not b or not b["urls"]:
+            continue
+        if now - b["ts"] <= max_age:
+            continue  # ещё ждём задание
+        PHOTO_BUFFERS.pop(uid, None)
+        try:
+            answer_photos(b.get("peer") or uid, uid, b["urls"], "")
+        except Exception as e:
+            print("   (flush:", e, ")")
+    save_state()
 
 
 def split_reply(text: str, limit: int = 3900) -> list:
@@ -396,32 +764,179 @@ def handle_message(msg: dict) -> None:
         return
     text = (msg.get("text") or "").strip()
     photos = []
+    voice_url = ""
     for a in msg.get("attachments") or []:
         if a.get("type") == "photo":
             best, area = "", 0
-            for s in (a.get("photo") or {}).get("sizes") or []:
-                sq = int(s.get("width", 0)) * int(s.get("height", 0))
-                if sq > area and s.get("url"):
-                    best, area = s["url"], sq
+            for sz in (a.get("photo") or {}).get("sizes") or []:
+                sq = int(sz.get("width", 0)) * int(sz.get("height", 0))
+                if sq > area and sz.get("url"):
+                    best, area = sz["url"], sq
             if best:
                 photos.append(best)
+        elif a.get("type") == "audio_message":
+            voice_url = ((a.get("audio_message") or {}).get("link_ogg") or "")
 
-    if text.lower() in ("/start", "начать"):
-        vk_send(peer_id, WELCOME)
+    low = text.lower().strip()
+
+    if low in ("/start", "начать", "/help", "?"):
+        vk_send(peer_id, WELCOME, keyboard=MENU_KEYBOARD)
         return
-    if text.lower() in ("/help", "?"):
-        vk_send(peer_id, WELCOME)
+    if low in ("/new", "/reset", "новый диалог", "🆕 новый диалог"):
+        clear_user_state(uid)
+        DRAW_PENDING.discard(uid)
+        MENU_PENDING.pop(uid, None)
+        vk_send(peer_id, "Начали заново! 🧹", keyboard=MENU_KEYBOARD)
         return
-    if text.lower() in ("/new", "/reset"):
-        history_clear(uid)
-        vk_send(peer_id, "Начали заново! 🧹")
+    if low in ("модель", "/model", "🧠 модель", "сменить модель"):
+        MENU_PENDING[uid] = time.time()
+        vk_send(peer_id, models_menu_text(uid), keyboard=MENU_KEYBOARD)
         return
-    if text.lower() == "/model":
-        p = PROVIDERS[SETTINGS["provider"]]
-        vk_send(peer_id, f"Модель: {p['model']}\nПровайдер: {SETTINGS['provider']}")
+    if low in ("профиль", "/profile", "👤 профиль"):
+        vk_send(peer_id, profile_text(uid), keyboard=MENU_KEYBOARD)
         return
+    if low in ("задание по фото", "📸 задание по фото", "фото"):
+        vk_send(peer_id,
+                "📸 Кидай фото заданий (можно несколько подряд) и напиши, "
+                "что с ними сделать — например «реши все». "
+                "Отвечу одним сообщением на все!",
+                keyboard=MENU_KEYBOARD)
+        return
+    # --- постоянная память о пользователе ---
+    m_f = re.match(r"^запомни[:,]?\s+(.+)$", low, re.I)
+    if m_f and len(m_f.group(1)) > 1:
+        fact = m_f.group(1).strip()[:200]
+        FACTS.setdefault(uid, []).append(fact)
+        FACTS[uid] = FACTS[uid][-20:]
+        save_state()
+        vk_send(peer_id, f"🧷 Запомнил: {fact}\n"
+                f"Всего фактов о тебе: {len(FACTS[uid])}", keyboard=MENU_KEYBOARD)
+        return
+    if low in ("забудь обо мне", "забудь всё обо мне"):
+        FACTS.pop(uid, None)
+        save_state()
+        vk_send(peer_id, "🧹 Забыл всё, что знал о тебе.", keyboard=MENU_KEYBOARD)
+        return
+
+    # --- напоминания (относительные: через N мин/часов/дней) ---
+    rem = parse_reminder(text)
+    if rem is not None:
+        secs, what = rem
+        REMINDERS.setdefault(uid, []).append(
+            {"at": time.time() + secs, "peer": peer_id, "text": what[:200]})
+        save_state()
+        human = f"{secs // 60} мин" if secs < 3600 else (
+            f"{secs // 3600} ч" if secs < 86400 else f"{secs // 86400} дн")
+        vk_send(peer_id, f"⏰ Хорошо, напомню через {human}"
+                + (f": {what}" if what else ""), keyboard=MENU_KEYBOARD)
+        return
+
+    # --- Википедия: «вики X», «что такое X», «кто такой X», «расскажи про X» ---
+    wiki_q = None
+    if low.startswith("вики "):
+        wiki_q = text[5:].strip()
+    else:
+        m_w = re.match(r"^(?:что|кто) (?:такое|такой|такая)\s+(.+?)[?.!]*$", low)
+        if not m_w:
+            m_w = re.match(r"^расскажи (?:про|о)\s+(.+?)[?.!]*$", low)
+        if m_w and len(m_w.group(1)) < 80:
+            wiki_q = m_w.group(1)
+    if wiki_q:
+        vk_send(peer_id, f"📚 Ищу в Википедии: {wiki_q[:80]}…", keyboard=MENU_KEYBOARD)
+        w = wiki_summary(wiki_q)
+        if w:
+            vk_send(peer_id, f"📚 {w[0]}\n\n🔗 {w[1]}" if w[1] else f"📚 {w[0]}",
+                    keyboard=MENU_KEYBOARD)
+            return
+        # статьи нет — падаем в обычный режим ИИ ниже
+
+    if low in ("нарисуй", "🎨 нарисуй", "нарисовать"):
+        DRAW_PENDING.add(uid)
+        vk_send(peer_id,
+                "🎨 Опиши, что нарисовать, одним сообщением.\n"
+                "Например: рыжий кот-космонавт в скафандре, мультяшный стиль",
+                keyboard=MENU_KEYBOARD)
+        return
+    if low.startswith("нарисуй "):
+        prompt = text[8:].strip()
+        if prompt:
+            vk_send(peer_id, f"🎨 Рисую: «{prompt[:120]}»… (до минуты)",
+                    keyboard=MENU_KEYBOARD)
+            try:
+                img = draw_image(prompt)
+                att = vk_upload_photo(peer_id, img)
+                vk_send(peer_id, "Готово! 🎨", attachment=att)
+            except RuntimeError as e:
+                vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+            except Exception as e:
+                vk_send(peer_id, "😔 Не получилось нарисовать: " + repr(e)[:120],
+                        keyboard=MENU_KEYBOARD)
+            return
+
+    # выбор жанра цифрой сразу после меню моделей
+    if uid in MENU_PENDING and time.time() - MENU_PENDING[uid] < 600 and low.isdigit():
+        n = int(low)
+        if 1 <= n <= len(GENRE_ORDER):
+            gid = GENRE_ORDER[n - 1]
+            set_genre(uid, gid)
+            MENU_PENDING.pop(uid, None)
+            vk_send(peer_id,
+                    f"✅ Профиль ИИ: {GENRES[gid][0]}\n"
+                    "Меняй в любой момент: «Модель»",
+                    keyboard=MENU_KEYBOARD)
+            return
+    # режим «Нарисуй» — следующее сообщение и есть описание
+    if uid in DRAW_PENDING and low and not low.startswith("/"):
+        DRAW_PENDING.discard(uid)
+        vk_send(peer_id, f"🎨 Рисую: «{text[:120]}»… (до минуты)",
+                keyboard=MENU_KEYBOARD)
+        try:
+            img = draw_image(text)
+            att = vk_upload_photo(peer_id, img)
+            vk_send(peer_id, "Готово! 🎨", attachment=att)
+        except RuntimeError as e:
+            vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+        except Exception as e:
+            vk_send(peer_id, "😔 Не получилось нарисовать: " + repr(e)[:120],
+                    keyboard=MENU_KEYBOARD)
+        return
+    if voice_url and not text:
+        vk_send(peer_id, "🎤 Слушаю голосовое…", keyboard=MENU_KEYBOARD)
+        try:
+            answer = voice_answer(voice_url, "")
+            for part in split_reply(answer):
+                vk_send(peer_id, part)
+        except RuntimeError as e:
+            vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+        except Exception as e:
+            vk_send(peer_id, "😔 Голосовое не разобрал: " + repr(e)[:100],
+                    keyboard=MENU_KEYBOARD)
+        return
+
     if not text and not photos:
         return
+
+    # фото без текста — копим, чтобы ответить на ВСЕ сразу одним ответом
+    if photos and not text:
+        buf = PHOTO_BUFFERS.setdefault(uid, {"urls": [], "peer": peer_id, "ts": 0})
+        buf["urls"].extend(photos)
+        buf["ts"] = time.time()
+        save_state()
+        n = len(buf["urls"])
+        vk_send(peer_id,
+                f"📸 Принял фото №{n}. Кидай следующие, а когда закончишь — "
+                "напиши задание текстом (например: «реши все номера»). "
+                "Отвечу на все фото сразу.\n"
+                "Если задания не будет — сам отвечу через ~2 минуты.")
+        return
+
+    # есть текст: забираем накопленные фото (если были) — отвечаем на всё вместе
+    buffered: list = []
+    if text:
+        buf = PHOTO_BUFFERS.pop(uid, None)
+        if buf:
+            buffered = buf["urls"]
+            save_state()
 
     stop = threading.Event()
     raw_store: str | None = None
@@ -437,13 +952,16 @@ def handle_message(msg: dict) -> None:
         pass
 
     try:
-        if photos:
-            answer = ai_vision(text, photos)
-            user_text = text or "(картинка)"
+        if photos or buffered:
+            prompt = text or DEFAULT_PHOTO_TASK
+            answer = ai_vision(prompt, (photos + buffered)[:10])
+            user_text = text or f"(фото: {len(photos or buffered)} шт.)"
         else:
-            messages = ([{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = ([{"role": "system",
+                          "content": SYSTEM_PROMPT + facts_block(uid)}]
                         + history_get(uid) + [{"role": "user", "content": text}])
-            raw_answer = ai_chat(messages)
+            raw_answer = ai_chat(messages, uid,
+                                 genre=detect_genre(text) if uid not in USER_GENRE else None)
             raw_store = raw_answer
             answer = md_to_text(strip_think(raw_answer))
             user_text = text
@@ -516,8 +1034,10 @@ def poll_loop() -> None:
     seen: dict[int, int] = {}
     first = True
     while True:
+        check_reminders()
         poll_cycle(seen, first)
         first = False
+        flush_buffers()
         time.sleep(2.5)
 
 

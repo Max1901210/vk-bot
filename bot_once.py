@@ -18,8 +18,12 @@ first = True
 deadline = time.time() + int(os.environ.get("RUN_SECONDS", "260"))
 cycles = 0
 while time.time() < deadline:
+    vbs.check_reminders()
     vbs.poll_cycle(seen, first)
     first = False
+    vbs.flush_buffers(90)
     cycles += 1
     time.sleep(8)
+vbs.check_reminders()
+vbs.flush_all_buffers(180)  # старые пачки — отвечаем, свежие — сохраняем в состояние
 print(f"[i] Дежурство окончено (проходов: {cycles})")
