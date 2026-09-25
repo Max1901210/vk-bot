@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: vk-bot
+  cancel-in-progress: false
+
 jobs:
   duty:
     runs-on: ubuntu-latest
@@ -28,8 +32,16 @@ jobs:
           PROVIDER: openrouter
           RUN_SECONDS: "260"
       - name: Сохранить память бота
+        continue-on-error: true
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name "vk-bot"
           git add bot_state.json
-          git diff --cached --quiet || (git commit -m "память бота" && git push)
+          git diff --cached --quiet && echo "память не изменилась" && exit 0
+          git commit -m "память бота" || true
+          for i in 1 2 3; do
+            if git push; then echo "память сохранена"; break; fi
+            echo "push не прошёл, повтор $i"
+            git pull --rebase origin main || true
+            sleep 5
+          done
