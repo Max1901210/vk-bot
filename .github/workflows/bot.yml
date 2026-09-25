@@ -23,4 +23,5 @@ jobs:
           VK_TOKEN: ${{ secrets.VK_TOKEN }}
           VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
           AI_KEY: ${{ secrets.AI_KEY }}
+          PROVIDER: openrouter
           RUN_SECONDS: "260"
