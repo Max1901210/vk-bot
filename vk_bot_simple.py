@@ -63,8 +63,12 @@ PROVIDERS = {
     },
 }
 VISION_RE = ("gemini", "llama-4", "llama-4-maverick", "vision", "vl", "qwen2.5-vl")
-# отдельная модель для картинок (умеет читать фото заданий и т.п.)
-VISION_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+# модели со «зрением»: первая — быстрая, без долгих размышлений
+VISION_MODELS = [
+    ("dots-studio/dots-3-note-preview:free", 4000),
+    ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 12000),
+    ("google/gemma-4-31b-it:free", 4000),
+]
 
 SYSTEM_PROMPT = (
     "Ты — дружелюбный ИИ-ассистент внутри ВКонтакте. Отвечай на языке "
@@ -87,6 +91,8 @@ def load_settings() -> dict:
                      ("api_key", "AI_KEY"), ("provider", "PROVIDER")):
         if os.environ.get(env):
             s[key] = os.environ[env]
+    if not s.get("provider"):
+        s["provider"] = "openrouter"  # разумное значение по умолчанию
     return s
 
 
@@ -264,7 +270,7 @@ def ai_chat(messages: list) -> str:
     last_err = "unknown"
     saw_429 = False
     for model in models:
-        body = {"model": model, "messages": messages}
+        body = {"model": model, "messages": messages, "max_tokens": 8000}
         url = p["base"] + "/chat/completions"
         try:
             data = http_post(url, json_body=body, headers=headers, timeout=90)
@@ -294,7 +300,7 @@ def ai_chat(messages: list) -> str:
 
 
 def ai_vision(prompt: str, image_urls: list) -> str:
-    """Вопрос про картинки: скачиваем и отправляем в специальную модель со «зрением»."""
+    """Вопрос про картинки: пробуем несколько моделей со «зрением» по очереди."""
     parts = [{"type": "text", "text": prompt or "Что на картинке?"}]
     loaded = 0
     for u in image_urls[:2]:
@@ -310,27 +316,37 @@ def ai_vision(prompt: str, image_urls: list) -> str:
     if not loaded:
         raise RuntimeError("Не удалось загрузить картинку, попробуй ещё раз.")
     p = PROVIDERS[SETTINGS["provider"]]
-    body = {
-        "model": VISION_MODEL,
-        "messages": [{"role": "user", "content": parts}],
-        "max_tokens": 8000,  # модели нужно место на рассуждения перед ответом
-    }
     headers = {"Authorization": "Bearer " + SETTINGS["api_key"],
                "Content-Type": "application/json"}
     if SETTINGS["provider"] == "openrouter":
         headers["X-Title"] = "VK AI Bot"
-    try:
-        data = http_post(p["base"] + "/chat/completions", json_body=body,
-                         headers=headers, timeout=300)
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        if content and content.strip():
-            return content.strip()
-        raise RuntimeError("модель вернула пустой ответ")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Модель для картинок недоступна (HTTP {e.code}). "
-                           "Подожди минуту и пришли фото снова.")
-    except Exception as e:
-        raise RuntimeError(f"Не получилось разобрать фото ({e}). Попробуй ещё раз.")
+
+    last_err = "unknown"
+    for model, max_tokens in VISION_MODELS:
+        body = {"model": model, "messages": [{"role": "user", "content": parts}],
+                "max_tokens": max_tokens}
+        for attempt in range(2):  # две попытки на модель
+            try:
+                data = http_post(p["base"] + "/chat/completions", json_body=body,
+                                 headers=headers, timeout=300)
+                ch = (data.get("choices") or [{}])[0]
+                content = (ch.get("message") or {}).get("content", "")
+                if content and content.strip():
+                    return content.strip()
+                last_err = "пустой ответ"
+                if ch.get("finish_reason") == "length" and max_tokens < 12000:
+                    body["max_tokens"] = 12000  # размышления съели лимит — добавим
+                    continue
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}"
+                if e.code in (401, 403):
+                    raise RuntimeError("Ключ нейросети не принят. Проверь AI_KEY.")
+                break  # эта модель недоступна — следующая
+            except Exception as e:
+                last_err = repr(e)[:120]
+            time.sleep(2)
+    raise RuntimeError("Модели для картинок сейчас перегружены. "
+                       "Подожди 5 минут и пришли фото снова. (" + last_err + ")")
 
 
 def model_supports_vision() -> bool:
