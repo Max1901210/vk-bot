@@ -1,47 +1,17 @@
-name: vk-bot
+name: vk-bot-keepalive
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # каждые 5 минут
-  workflow_dispatch: {}      # кнопка «Run workflow» для ручного теста
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
-permissions:
-  contents: write
-
-concurrency:
-  group: vk-bot
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  duty:
+  ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Дежурство бота
-        run: python bot_once.py
-        env:
-          VK_TOKEN: ${{ secrets.VK_TOKEN }}
-          VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
-          AI_KEY: ${{ secrets.AI_KEY }}
-          PROVIDER: openrouter
-          RUN_SECONDS: "260"
-      - name: Сохранить память бота
-        continue-on-error: true
+      - name: Пульс для бота на Render (не даёт заснуть)
         run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name "vk-bot"
-          git add bot_state.json
-          git diff --cached --quiet && echo "память не изменилась" && exit 0
-          git commit -m "память бота" || true
-          for i in 1 2 3; do
-            if git push; then echo "память сохранена"; break; fi
-            echo "push не прошёл, повтор $i"
-            git pull --rebase origin main || true
-            sleep 5
-          done
+          curl -s -o /dev/null -w "пульс: %{http_code}\n" "${{ secrets.PING_URL }}" || true
