@@ -149,8 +149,20 @@ PHOTO_BUFFERS.update({int(k): v for k, v in _STATE.get("buffers", {}).items()})
 HISTORY: dict[int, list] = {int(k): v for k, v in _STATE.get("history", {}).items()}
 # постоянные факты о пользователе («запомни: я в 9 классе»)
 FACTS: dict[int, list] = {int(k): v for k, v in _STATE.get("facts", {}).items()}
+STATS: dict[int, dict] = {int(k): v for k, v in _STATE.get("stats", {}).items()}
 # напоминания: uid -> [{"at": ts, "peer": id, "text": str}]
 REMINDERS: dict[int, list] = {int(k): v for k, v in _STATE.get("reminders", {}).items()}
+
+
+def _pairs(x, cast=int):
+    out = {}
+    if isinstance(x, dict):
+        for k, v in x.items():
+            try:
+                out[cast(k)] = v
+            except Exception:
+                pass
+    return out
 
 
 def save_state() -> None:
@@ -159,8 +171,13 @@ def save_state() -> None:
         "buffers": {str(k): v for k, v in PHOTO_BUFFERS.items()},
         "history": {str(k): v for k, v in HISTORY.items()},
         "facts": {str(k): v for k, v in FACTS.items()},
+        "stats": {str(k): v for k, v in STATS.items()},
         "reminders": {str(k): v for k, v in REMINDERS.items()},
     }
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, STATE_FILE)  # атомарная запись: битых файлов не бывает
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -346,14 +363,14 @@ def voice_answer(audio_url: str, instruction: str) -> str:
              {"type": "input_audio",
               "input_audio": {"data": b64, "format": "ogg"}}]
     p = PROVIDERS[SETTINGS["provider"]]
-    body = {"model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-            "messages": [{"role": "user", "content": parts}],
-            "max_tokens": 8000}
-    headers = {"Authorization": "Bearer " + SETTINGS["api_key"],
-               "Content-Type": "application/json",
-               "X-Title": "VK AI Bot"}
     last = "unknown"
-    for _ in range(2):
+    for key in api_keys():
+        headers = {"Authorization": "Bearer " + key,
+                   "Content-Type": "application/json",
+                   "X-Title": "VK AI Bot"}
+        body = {"model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "messages": [{"role": "user", "content": parts}],
+                "max_tokens": 8000}
         try:
             data = http_post(p["base"] + "/chat/completions", json_body=body,
                              headers=headers, timeout=300)
@@ -368,12 +385,116 @@ def voice_answer(audio_url: str, instruction: str) -> str:
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
             if e.code in (401, 403):
-                raise RuntimeError("Ключ нейросети не принят.")
+                continue  # следующий ключ
         except Exception as e:
             last = repr(e)[:100]
         time.sleep(2)
     raise RuntimeError("Не получилось разобрать голосовое (" + last + "). "
                        "Напиши текстом — отвечу сразу.")
+
+def api_keys() -> list:
+    """Ключи OpenRouter: основной + AI_KEY2/AI_KEY3 (или через запятую в AI_KEY).
+    При лимитах бот молча переходит на следующий ключ."""
+    keys = []
+    k = (SETTINGS.get("api_key") or "").strip()
+    if k:
+        keys.append(k)
+    for env in ("AI_KEY2", "AI_KEY3"):
+        v = (os.environ.get(env) or "").strip()
+        if v:
+            keys.append(v)
+    if len(keys) == 1 and "," in keys[0]:
+        keys = [x.strip() for x in keys[0].split(",") if x.strip()]
+    return keys or [""]
+
+
+def get_json(url: str):
+    return json.loads(http_get_bytes(url))
+
+
+WEATHER_CODES = {0: "☀️ Ясно", 1: "🌤 Преимущественно ясно",
+    2: "⛅ Переменная облачность", 3: "☁️ Пасмурно", 45: "🌫 Туман",
+    48: "🌫 Изморозь", 51: "🌦 Морось", 53: "🌦 Морось", 55: "🌧 Морось",
+    61: "🌧 Дождь", 63: "🌧 Дождь", 65: "🌧 Сильный дождь",
+    66: "🌧 Ледяной дождь", 67: "🌧 Ледяной дождь", 71: "🌨 Снег",
+    73: "🌨 Снег", 75: "❄️ Сильный снег", 77: "❄️ Снежные зёрна",
+    80: "🌦 Ливни", 81: "🌧 Ливни", 82: "⛈ Сильные ливни",
+    85: "🌨 Снегопад", 86: "❄️ Сильный снегопад", 95: "⛈ Гроза",
+    96: "⛈ Гроза с градом", 99: "⛈ Сильная гроза с градом"}
+
+CURRENCY_CODES = {
+    "доллара": "USD", "доллар": "USD", "доллару": "USD", "usd": "USD",
+    "евро": "EUR", "eur": "EUR", "юаня": "CNY", "юань": "CNY", "cny": "CNY",
+    "фунта": "GBP", "фунт": "GBP", "gbp": "GBP", "тенге": "KZT", "kzt": "KZT",
+    "гривны": "UAH", "гривна": "UAH", "uah": "UAH", "лиры": "TRY",
+    "лира": "TRY", "try": "TRY", "дирхама": "AED", "дирхам": "AED",
+    "aed": "AED", "рубля": "RUB", "рубль": "RUB", "rub": "RUB"}
+
+
+def weather_text(city: str) -> str:
+    g = get_json("https://geocoding-api.open-meteo.com/v1/search"
+                 "?count=1&language=ru&format=json&name=" + urllib.parse.quote(city))
+    hits = g.get("results") or []
+    if not hits:
+        raise RuntimeError(f"Город «{city}» не нашёл. Проверь название.")
+    h = hits[0]
+    w = get_json(
+        "https://api.open-meteo.com/v1/forecast?timezone=auto"
+        f"&latitude={h['latitude']}&longitude={h['longitude']}"
+        "&current=temperature_2m,apparent_temperature,"
+        "relative_humidity_2m,wind_speed_10m,weather_code")
+    c = w.get("current") or {}
+    desc = WEATHER_CODES.get(int(c.get("weather_code", 0)), "☁️ Облачно")
+    return (f"🌤 {h.get('name')}, {h.get('country', '')}: {desc}\n"
+            f"🌡 {c.get('temperature_2m', '?')}°C (ощущается как "
+            f"{c.get('apparent_temperature', '?')}°C)\n"
+            f"💨 ветер {c.get('wind_speed_10m', '?')} км/ч · "
+            f"💧 влажность {c.get('relative_humidity_2m', '?')}%")
+
+
+def currency_text(amount: float, code: str) -> str:
+    d = get_json("https://open.er-api.com/v6/latest/" + code)
+    rub = (d.get("rates") or {}).get("RUB")
+    if not rub:
+        raise RuntimeError("Курс сейчас недоступен.")
+    return (f"💱 {amount:g} {code} = {rub * amount:,.2f} ₽\n"
+            f"(курс: 1 {code} = {rub:,.2f} ₽)")
+
+
+def bump_stat(uid: int, key: str, n: int = 1) -> None:
+    st = STATS.setdefault(uid, {})
+    st[key] = st.get(key, 0) + n
+
+
+SUMMARY_MARKER = "📌 Краткая память о начале диалога:"
+
+
+def summarize_dialog(old_msgs: list) -> str:
+    """Сжимаем начало диалога, чтобы память жила дольше лимита."""
+    dialog = "\n".join(
+        ("Юзер: " if x["role"] == "user" else "Бот: ") + x["content"][:400]
+        for x in old_msgs)
+    p = PROVIDERS[SETTINGS["provider"]]
+    model = (GENRES.get("fast", (0, [p["model"]]))[1])[0]
+    body = {"model": model, "max_tokens": 250, "messages": [{"role": "user",
+        "content": "Сожми диалог в 3-4 предложения, сохранив важные факты "
+                   "(имена, числа, договорённости):\n" + dialog}]}
+    last = "unknown"
+    for key in api_keys():
+        headers = {"Authorization": "Bearer " + key,
+                   "Content-Type": "application/json"}
+        if SETTINGS["provider"] == "openrouter":
+            headers["X-Title"] = "VK AI Bot"
+        try:
+            data = http_post(p["base"] + "/chat/completions", json_body=body,
+                             headers=headers, timeout=60)
+            out = ((data.get("choices") or [{}])[0].get("message")
+                   or {}).get("content", "")
+            if out and out.strip():
+                return out.strip()[:700]
+        except Exception as e:
+            last = repr(e)[:80]
+    raise RuntimeError(last)
 
 
 REMINDER_RE = re.compile(
@@ -453,7 +574,17 @@ def history_add(uid: int, user_text: str, answer: str) -> None:
     h = HISTORY.setdefault(uid, [])
     h.append({"role": "user", "content": user_text})
     h.append({"role": "assistant", "content": answer})
-    HISTORY[uid] = h[-HISTORY_LIMIT:]
+    # если история переполнилась — сжимаем начало в краткую «долгую память»
+    has_summary = bool(h) and h[0].get("role") == "system" \
+        and SUMMARY_MARKER in h[0].get("content", "")
+    if len(h) >= HISTORY_LIMIT + 2 and not has_summary:
+        try:
+            summ = summarize_dialog(h[:8])
+            h = [{"role": "system", "content": f"{SUMMARY_MARKER} {summ}"}] + h[8:]
+        except Exception as e:
+            print("   (сжатие памяти:", e, ")")
+            h = h[-HISTORY_LIMIT:]
+    HISTORY[uid] = h[-(HISTORY_LIMIT + 1):]
     save_state()
 
 
@@ -515,7 +646,7 @@ def md_to_text(text: str) -> str:
 
 def ai_chat(messages: list, uid: int | None = None,
             genre: str | None = None) -> str:
-    """Задаём вопрос нейросети (не стриминг — просто ждём ответ)."""
+    """Вопрос нейросети. При лимитах (429) молча переходит на другой ключ."""
     p = PROVIDERS[SETTINGS["provider"]]
     genre = genre or (USER_GENRE.get(uid) if uid else None)
     extra_system = ""
@@ -527,37 +658,44 @@ def ai_chat(messages: list, uid: int | None = None,
     if extra_system and messages and messages[0].get("role") == "system":
         messages = [dict(messages[0])]
         messages[0]["content"] += "\n\n" + extra_system
-    headers = {"Authorization": "Bearer " + SETTINGS["api_key"]}
-    if SETTINGS["provider"] == "openrouter":
-        headers["X-Title"] = "VK AI Bot"
+
     last_err = "unknown"
     saw_429 = False
-    for model in models:
-        body = {"model": model, "messages": messages, "max_tokens": 8000}
-        url = p["base"] + "/chat/completions"
-        try:
-            data = http_post(url, json_body=body, headers=headers, timeout=90)
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            if content and content.strip():
-                return content.strip()
-            last_err = "пустой ответ"
-        except urllib.error.HTTPError as e:
+    bad_keys = 0
+    keys = api_keys()
+    for key in keys:
+        headers = {"Authorization": "Bearer " + key}
+        if SETTINGS["provider"] == "openrouter":
+            headers["X-Title"] = "VK AI Bot"
+        key_ok = False
+        for model in models:
+            body = {"model": model, "messages": messages, "max_tokens": 8000}
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                detail = ""
-            last_err = f"HTTP {e.code}: {detail}"
-            if e.code == 429:
-                saw_429 = True
-                continue  # лимит — пробуем следующую модель
-            if e.code in (401, 403):
-                raise RuntimeError("Ключ нейросети не принят (401/403). Проверь его: "
-                                   "удали файл bot_settings.json и запусти заново.")
-            continue  # модель недоступна — пробуем следующую
-        except Exception as e:
-            last_err = repr(e)
-    if saw_429:
-        raise RuntimeError("Все бесплатные модели сейчас перегружены (лимит). "
+                data = http_post(p["base"] + "/chat/completions", json_body=body,
+                                 headers=headers, timeout=90)
+                content = ((data.get("choices") or [{}])[0].get("message")
+                           or {}).get("content", "")
+                if content and content.strip():
+                    return content.strip()
+                last_err = "пустой ответ"
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:200]
+                except Exception:
+                    detail = ""
+                last_err = f"HTTP {e.code}: {detail}"
+                if e.code == 429:
+                    saw_429 = True
+                    continue
+                if e.code in (401, 403):
+                    break  # ключ не принят — попробуем следующий
+                continue
+            except Exception as e:
+                last_err = repr(e)
+        if key_ok:
+            break
+    if saw_429 and bad_keys < len(keys):
+        raise RuntimeError("Все модели сейчас перегружены (лимиты). "
                            "Подожди минуту-другую и попробуй снова.")
     raise RuntimeError(f"Нейросеть не ответила ({last_err}).")
 
@@ -579,16 +717,16 @@ def ai_vision(prompt: str, image_urls: list) -> str:
     if not loaded:
         raise RuntimeError("Не удалось загрузить картинку, попробуй ещё раз.")
     p = PROVIDERS[SETTINGS["provider"]]
-    headers = {"Authorization": "Bearer " + SETTINGS["api_key"],
-               "Content-Type": "application/json"}
-    if SETTINGS["provider"] == "openrouter":
-        headers["X-Title"] = "VK AI Bot"
-
     last_err = "unknown"
     for model, max_tokens in VISION_MODELS:
         body = {"model": model, "messages": [{"role": "user", "content": parts}],
                 "max_tokens": max_tokens}
-        for attempt in range(2):  # две попытки на модель
+        for key in api_keys():
+          headers = {"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json"}
+          if SETTINGS["provider"] == "openrouter":
+              headers["X-Title"] = "VK AI Bot"
+          for attempt in range(2):  # две попытки на модель/ключ
             try:
                 data = http_post(p["base"] + "/chat/completions", json_body=body,
                                  headers=headers, timeout=300)
@@ -603,11 +741,11 @@ def ai_vision(prompt: str, image_urls: list) -> str:
             except urllib.error.HTTPError as e:
                 last_err = f"HTTP {e.code}"
                 if e.code in (401, 403):
-                    raise RuntimeError("Ключ нейросети не принят. Проверь AI_KEY.")
-                break  # эта модель недоступна — следующая
+                    break  # ключ не принят — следующий ключ/модель
+                break
             except Exception as e:
                 last_err = repr(e)[:120]
-            time.sleep(2)
+            time.sleep(1)
     raise RuntimeError("Модели для картинок сейчас перегружены. "
                        "Подожди 5 минут и пришли фото снова. (" + last_err + ")")
 
@@ -628,6 +766,8 @@ WELCOME = (
     "⏰ «Напомни через 30 минут …» — не забуду\n"
     "🧷 «Запомни: я в 9 классе» — учту всегда\n"
     "📚 «Что такое фотосинтез» — справка из Википедии\n"
+    "🌤 «погода Москва» · 💱 «курс доллара» · 🧮 «сколько 234*12»\n"
+    "📄 пришли файл .txt — прочитаю и помогу\n"
     "👤 «Профиль» — твоя статистика\n"
     "🆕 «Новый диалог» — забуду контекст\n\n"
     "Просто пиши вопросы — отвечу!"
@@ -669,11 +809,14 @@ def profile_text(uid: int) -> str:
     msgs = len(h) // 2
     facts = FACTS.get(uid) or []
     rems = REMINDERS.get(uid) or []
+    st = STATS.get(uid, {})
     out = ("👤 Твой профиль\n\n"
            f"🧠 Профиль ИИ: {GENRES[gid][0]}\n"
            f"💬 Сообщений в диалоге: {msgs}\n"
            f"🧷 Фактов обо мне: {len(facts)}\n"
-           f"⏰ Активных напоминаний: {len(rems)}")
+           f"⏰ Активных напоминаний: {len(rems)}\n"
+           f"📊 Всего: ответов {st.get('messages', 0)} · фото {st.get('photos', 0)}"
+           f" · картинок {st.get('draws', 0)} · файлов {st.get('files', 0)}")
     if facts:
         out += "\n\n🧷 Я помню:\n" + "\n".join(f"• {f}" for f in facts[-7:])
     out += ("\n\nСменить профиль: «Модель»\n"
@@ -764,6 +907,7 @@ def handle_message(msg: dict) -> None:
         return
     text = (msg.get("text") or "").strip()
     photos = []
+    docs: list = []
     voice_url = ""
     for a in msg.get("attachments") or []:
         if a.get("type") == "photo":
@@ -776,6 +920,10 @@ def handle_message(msg: dict) -> None:
                 photos.append(best)
         elif a.get("type") == "audio_message":
             voice_url = ((a.get("audio_message") or {}).get("link_ogg") or "")
+        elif a.get("type") == "doc":
+            d = a.get("doc") or {}
+            if (d.get("ext") or "").lower() in ("txt", "md", "log", "csv") and d.get("url"):
+                docs.append({"title": d.get("title") or "файл", "url": d["url"]})
 
     low = text.lower().strip()
 
@@ -850,6 +998,58 @@ def handle_message(msg: dict) -> None:
             return
         # статьи нет — падаем в обычный режим ИИ ниже
 
+    # --- погода ---
+    m_w = re.match(r"^(?:погода|weather)(?:\s+в)?\s+(.+?)[?.!]*$", low)
+    if m_w and len(m_w.group(1)) < 60:
+        city = m_w.group(1).strip()
+        vk_send(peer_id, f"🌤 Смотрю погоду: {city.title()}…", keyboard=MENU_KEYBOARD)
+        try:
+            vk_send(peer_id, weather_text(city), keyboard=MENU_KEYBOARD)
+        except RuntimeError as e:
+            vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+        except Exception as e:
+            vk_send(peer_id, "😔 Сервис погоды недоступен: " + repr(e)[:80],
+                    keyboard=MENU_KEYBOARD)
+        return
+
+    # --- курс валют ---
+    m_c = re.match(r"^курс\s+([а-яa-z]+)", low)
+    if m_c and m_c.group(1) in CURRENCY_CODES:
+        code = CURRENCY_CODES[m_c.group(1)]
+        try:
+            vk_send(peer_id, currency_text(1, code), keyboard=MENU_KEYBOARD)
+        except Exception as e:
+            vk_send(peer_id, "😔 Сервис курсов недоступен: " + repr(e)[:80],
+                    keyboard=MENU_KEYBOARD)
+        return
+
+    # --- калькулятор (точно, без нейросети) ---
+    m_calc = re.match(r"^(?:сколько\s+(?:будет\s+)?)?([\d\s+\-*/().,%^]+?)[\s?=]*$", low)
+    if (m_calc and re.search(r"\d\s*[+\-*/%^]\s*\d", m_calc.group(1))
+            and not re.search(r"[а-яa-z]", m_calc.group(1))):
+        expr = m_calc.group(1).replace("^", "**").replace(",", ".")
+        try:
+            val = eval(expr, {"__builtins__": {}}, {})
+            val = round(val, 8)
+            vk_send(peer_id, f"🧮 {m_calc.group(1).strip()} = {val:g}",
+                    keyboard=MENU_KEYBOARD)
+            return
+        except Exception:
+            pass
+
+    # --- статистика ---
+    if low in ("статистика", "/stats", "📊 статистика"):
+        st = STATS.get(uid, {})
+        vk_send(peer_id,
+                "📊 Твоя статистика\n\n"
+                f"💬 Ответов: {st.get('messages', 0)}\n"
+                f"📸 Фото решено: {st.get('photos', 0)}\n"
+                f"🎨 Картинок нарисовано: {st.get('draws', 0)}\n"
+                f"📄 Файлов прочитано: {st.get('files', 0)}\n"
+                f"🧷 Фактов запомнено: {len(FACTS.get(uid) or [])}",
+                keyboard=MENU_KEYBOARD)
+        return
+
     if low in ("нарисуй", "🎨 нарисуй", "нарисовать"):
         DRAW_PENDING.add(uid)
         vk_send(peer_id,
@@ -866,6 +1066,7 @@ def handle_message(msg: dict) -> None:
                 img = draw_image(prompt)
                 att = vk_upload_photo(peer_id, img)
                 vk_send(peer_id, "Готово! 🎨", attachment=att)
+                bump_stat(uid, "draws")
             except RuntimeError as e:
                 vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
             except Exception as e:
@@ -913,7 +1114,37 @@ def handle_message(msg: dict) -> None:
                     keyboard=MENU_KEYBOARD)
         return
 
-    if not text and not photos:
+    # --- документы (txt/md/csv): читаем и работаем с содержимым ---
+    if docs and not photos and not voice_url:
+        vk_send(peer_id, "📄 Читаю файл" + ("ы" if len(docs) > 1 else "") + "…",
+                keyboard=MENU_KEYBOARD)
+        blocks = []
+        for d in docs[:2]:
+            try:
+                txt = http_get_bytes(d["url"]).decode("utf-8", "replace")[:6000]
+                blocks.append(f"Файл «{d['title']}»:\n{txt}")
+            except Exception as e:
+                print("   (файл:", e, ")")
+        if not blocks:
+            vk_send(peer_id, "😔 Не смог прочитать файл. Пришли текстом — сделаю всё.",
+                    keyboard=MENU_KEYBOARD)
+            return
+        prompt = text or "Кратко перескажи содержание и предложи, чем помочь."
+        messages = ([{"role": "system", "content": SYSTEM_PROMPT + facts_block(uid)}]
+                    + history_get(uid)
+                    + [{"role": "user", "content": prompt + "\n\n" + "\n\n".join(blocks)}])
+        try:
+            answer = md_to_text(strip_think(ai_chat(messages, uid)))
+        except RuntimeError as e:
+            vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+            return
+        bump_stat(uid, "files")
+        for part in split_reply(answer):
+            vk_send(peer_id, part)
+        save_state()
+        return
+
+    if not text and not photos and not docs:
         return
 
     # фото без текста — копим, чтобы ответить на ВСЕ сразу одним ответом
@@ -955,6 +1186,7 @@ def handle_message(msg: dict) -> None:
         if photos or buffered:
             prompt = text or DEFAULT_PHOTO_TASK
             answer = ai_vision(prompt, (photos + buffered)[:10])
+            bump_stat(uid, "photos")
             user_text = text or f"(фото: {len(photos or buffered)} шт.)"
         else:
             messages = ([{"role": "system",
@@ -962,6 +1194,7 @@ def handle_message(msg: dict) -> None:
                         + history_get(uid) + [{"role": "user", "content": text}])
             raw_answer = ai_chat(messages, uid,
                                  genre=detect_genre(text) if uid not in USER_GENRE else None)
+            bump_stat(uid, "messages")
             raw_store = raw_answer
             answer = md_to_text(strip_think(raw_answer))
             user_text = text
