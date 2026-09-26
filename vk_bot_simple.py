@@ -41,7 +41,79 @@ STATE_FILE = os.path.join(SCRIPT_DIR, os.environ.get("STATE_FILE", "bot_state.js
 HISTORY_LIMIT = 20  # сообщений диалога в памяти (на пользователя)
 
 
+# --- синхронизация памяти через GitHub API (режим 24/7 вне GitHub Actions) ---
+GH_SYNC_REPO = os.environ.get("GH_SYNC_REPO", "").strip()
+GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
+GH_API = (os.environ.get("GH_API_BASE") or "https://api.github.com").rstrip("/")
+_GH_SHA = {"v": None}
+_GH_LAST = {"t": 0.0}   # защита от слишком частых записей
+
+
+def _gh_req(path: str, method: str = "GET", body: dict | None = None):
+    req = urllib.request.Request(
+        GH_API + path, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": "Bearer " + GH_TOKEN,
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "vk-bot",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def gh_load_state() -> dict | None:
+    """Память бота читаем из репозитория — работает на любом хостинге."""
+    if not (GH_SYNC_REPO and GH_TOKEN):
+        return None
+    try:
+        d = _gh_req(f"/repos/{GH_SYNC_REPO}/contents/bot_state.json")
+        _GH_SHA["v"] = d.get("sha")
+        return json.loads(base64.b64decode(d.get("content") or "").decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print("   (gh_load: HTTP", e.code, ")")
+        return None
+    except Exception as e:
+        print("   (gh_load:", e, ")")
+        return None
+
+
+def gh_save_state(data: dict) -> None:
+    if not (GH_SYNC_REPO and GH_TOKEN):
+        return
+    now = time.time()
+    if now - _GH_LAST["t"] < 120:   # не чаще раза в 2 минуты
+        return
+    _GH_LAST["t"] = now
+    content = base64.b64encode(
+        json.dumps(data, ensure_ascii=False).encode("utf-8")).decode()
+    body = {"message": "память бота", "content": content}
+    if _GH_SHA["v"]:
+        body["sha"] = _GH_SHA["v"]
+    try:
+        d = _gh_req(f"/repos/{GH_SYNC_REPO}/contents/bot_state.json",
+                    method="PUT", body=body)
+        _GH_SHA["v"] = (d.get("content") or {}).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code in (409, 422):  # файл обновился иначе — перечитаем и повторим
+            try:
+                d2 = _gh_req(f"/repos/{GH_SYNC_REPO}/contents/bot_state.json")
+                body["sha"] = d2.get("sha")
+                d = _gh_req(f"/repos/{GH_SYNC_REPO}/contents/bot_state.json",
+                            method="PUT", body=body)
+                _GH_SHA["v"] = (d.get("content") or {}).get("sha")
+            except Exception as e2:
+                print("   (gh_save повтор:", e2, ")")
+        else:
+            print("   (gh_save: HTTP", e.code, ")")
+    except Exception as e:
+        print("   (gh_save:", e, ")")
+
+
 def _load_state() -> dict:
+    data = gh_load_state()
+    if data:
+        return data
     """Состояние бота: жанры, история, накопленные фото.
     В облаке файл коммитится обратно в репозиторий — память живёт вечно."""
     if os.path.exists(STATE_FILE):
@@ -79,8 +151,9 @@ VISION_RE = ("gemini", "llama-4", "llama-4-maverick", "vision", "vl", "qwen2.5-v
 # модели со «зрением»: первая — быстрая, без долгих размышлений
 VISION_MODELS = [
     ("dots-studio/dots-3-note-preview:free", 4000),
-    ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 12000),
     ("google/gemma-4-31b-it:free", 4000),
+    ("qwen/qwen3.8-27b:free", 4000),
+    ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 12000),
 ]
 
 # накопитель фото: присылаешь по одному — бот копит и отвечает на все сразу
@@ -95,6 +168,7 @@ GENRES = {
         "dots-studio/dots-3-note-preview:free",
         "google/gemma-4-31b-it:free",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "thinkingmachines/inkling:free",
     ], ""),
     "study": ("🎓 Учёба и сложные задачи", [
         "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -113,6 +187,7 @@ GENRES = {
        "измерения указывай всегда."),
     "lang": ("🌍 Переводчик и языки", [
         "nvidia/nemotron-3.5-lightning:free",
+        "thinkingmachines/inkling-small:free",
         "google/gemma-4-31b-it:free",
         "dots-studio/dots-3-note-preview:free",
     ], "Ты — профессиональный переводчик. Присланный текст переводи на "
@@ -120,6 +195,7 @@ GENRES = {
        "После перевода дай 1-2 коротких заметки о нюансах перевода."),
     "texts": ("✍️ Сочинения и тексты", [
         "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "thinkingmachines/inkling-small:free",
         "google/gemma-4-31b-it:free",
         "nvidia/nemotron-3.5-lightning:free",
     ], "Ты — писатель и редактор. Пиши живым, чистым языком, без воды. "
@@ -127,6 +203,9 @@ GENRES = {
        "запрошенный объём и стиль (или разумный по умолчанию)."),
     "code": ("💻 Программирование", [
         "qwen/qwen3.8-27b:free",
+        "poolside/laguna-s-2.1:free",
+        "cohere/north-mini-code:free",
+        "poolside/laguna-xs-2.1:free",
         "nvidia/nemotron-3.5-lightning:free",
         "dots-studio/dots-3-note-preview:free",
     ], "Ты — опытный разработчик. Давай рабочий код в блоках ``` с языком, "
@@ -134,11 +213,31 @@ GENRES = {
        "как улучшить."),
     "fast": ("⚡ Быстрые ответы", [
         "dots-studio/dots-3-note-preview:free",
+        "inclusionai/ling-3.0-flash-sante:free",
         "nvidia/nemotron-3.5-lightning:free",
     ], "Отвечай максимально кратко и по делу: только суть, без вступлений "
        "и повторов вопроса. Максимум 3-4 предложения, если не попросили иначе."),
+    "max": ("👑 Максимум (самый умный)", [
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "thinkingmachines/inkling:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "google/gemma-4-26b-a4b-it:free",
+    ], "Показывай максимум качества: глубокий разбор задачи, все важные "
+       "детали, проверка выводов. Отвечай подробно, структурировано, с "
+       "примерами. Не упрощай без просьбы."),
 }
-GENRE_ORDER = ["auto", "study", "fast", "code"]
+GENRE_ORDER = ["auto", "study", "math", "lang", "texts", "code", "fast", "max"]
+
+GENRE_HINTS = {
+    "auto": "сам подбираю стиль под запрос",
+    "study": "репетитор: пошагово и понятно",
+    "math": "Дано → Формула → Вычисление → Ответ",
+    "lang": "переводы с нюансами",
+    "texts": "сочинения, стихи, доклады",
+    "code": "код и отладка",
+    "fast": "самые короткие ответы",
+    "max": "самая мощная модель, глубокие ответы",
+}
 USER_GENRE: dict[int, str] = {}      # uid -> жанр
 DRAW_PENDING: set[int] = set()       # uid, нажавших «Нарисуй»
 MENU_PENDING: dict[int, float] = {}  # uid -> время показа меню моделей
@@ -178,6 +277,7 @@ def save_state() -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, STATE_FILE)  # атомарная запись: битых файлов не бывает
+    gh_save_state(data)          # на 24/7-хостинге дублируем в репозиторий
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -761,13 +861,14 @@ WELCOME = (
     "Привет! Я твой ИИ-помощник 🤖\n\n"
     "📸 Кидай фото заданий (можно сразу несколько) + текст — решу всё одним ответом\n"
     "🎨 «Нарисуй рыжего кота в космосе» — нарисую картинку\n"
-    "🧠 Сам подбираю профиль под запрос (математика, код, перевод…)\n"
+    "🧠 8 профилей ИИ — от быстрых до самого умного (кнопка «🧠 Модель»)\n"
     "🎤 Голосовые — просто говори, я пойму и отвечу\n"
     "⏰ «Напомни через 30 минут …» — не забуду\n"
     "🧷 «Запомни: я в 9 классе» — учту всегда\n"
     "📚 «Что такое фотосинтез» — справка из Википедии\n"
     "🌤 «погода Москва» · 💱 «курс доллара» · 🧮 «сколько 234*12»\n"
     "📄 пришли файл .txt — прочитаю и помогу\n"
+    "🖼 «что на моей аватарке?» — разгляжу и опишу\n"
     "👤 «Профиль» — твоя статистика\n"
     "🆕 «Новый диалог» — забуду контекст\n\n"
     "Просто пиши вопросы — отвечу!"
@@ -798,8 +899,9 @@ def models_menu_text(uid: int) -> str:
     lines = ["🧠 Выбери профиль ИИ — ответь номером (например: 2):", ""]
     for i, gid in enumerate(GENRE_ORDER, 1):
         mark = "✅ " if gid == cur else ""
-        lines.append(f"{mark}{i}. {GENRES[gid][0]}")
-    lines += ["", "📸 Фото заданий принимаю всегда — просто пришли картинку."]
+        lines.append(f"{mark}{i}. {GENRES[gid][0]} — {GENRE_HINTS.get(gid, '')}")
+    lines += ["", "Переключать можно в любой момент — ответь цифрой.",
+              "📸 Фото заданий принимаю всегда — просто пришли картинку."]
     return "\n".join(lines)
 
 
@@ -1112,6 +1214,34 @@ def handle_message(msg: dict) -> None:
         except Exception as e:
             vk_send(peer_id, "😔 Голосовое не разобрал: " + repr(e)[:100],
                     keyboard=MENU_KEYBOARD)
+        return
+
+    # --- аватарка: ВК не прикладывает её к сообщению — достаём сами и смотрим ---
+    if "аватар" in low and not photos and not voice_url and not docs:
+        url = ""
+        try:
+            resp = vk("users.get", user_ids=str(uid),
+                      fields="photo_200_original,photo_200")
+            u0 = ((resp or [{}])[0]) or {}
+            url = u0.get("photo_200_original") or u0.get("photo_200") or ""
+        except Exception as e:
+            print("   (аватар:", e, ")")
+        if not url:
+            vk_send(peer_id, "😔 Не смог достать аватарку. Пришли её обычным фото "
+                             "(значок 📷) и спроси — всё опишу!",
+                    keyboard=MENU_KEYBOARD)
+            return
+        vk_send(peer_id, "🖼 Разглядываю аватарку…", keyboard=MENU_KEYBOARD)
+        try:
+            prompt = text or ("Посмотри на аватарку: кто или что на ней изображено? "
+                              "Опиши кратко, живо и по-доброму.")
+            answer = md_to_text(strip_think(ai_vision(prompt, [url])))
+            bump_stat(uid, "photos")
+            for part in split_reply(answer):
+                vk_send(peer_id, part)
+        except RuntimeError as e:
+            vk_send(peer_id, "😔 " + str(e), keyboard=MENU_KEYBOARD)
+        save_state()
         return
 
     # --- документы (txt/md/csv): читаем и работаем с содержимым ---
